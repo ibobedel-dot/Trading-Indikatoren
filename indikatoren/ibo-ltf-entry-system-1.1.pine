@@ -1,0 +1,848 @@
+//@version=6
+indicator("Ibo LTF Entry System 1.1", shorttitle = "Ibo LTF 1.1", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// =====================================================================
+// IBO LTF ENTRY SYSTEM 1.1 — für M1, M2 und M5
+// 1 Liquidität : signifikante Swing-Hochs (BSL) / -Tiefs (SSL), nach Stärke gewichtet.
+//                Abgeholte Levels zählen als verbraucht (jedes Level nur einmal).
+// 2 Sweep      : Grab (Close zurück im Level innerhalb von 1–N Kerzen) oder
+//                Sweep (Preis bleibt mindestens X Minuten jenseits des Levels, höchstens Y Minuten).
+//                Tiefe des Stichs zwischen Mindest- und Maximaltiefe (× ATR).
+//                Danach muss eine Reaktion kommen (Verdrängungskerze ≥ X × ATR).
+//                Das FVG-Zeitfenster startet erst, wenn der Preis wieder zurück ist.
+// 3 FVG / Plan : die ERSTE FVG in Gegenrichtung nach dem Sweep wird sofort zum Plan (Entry, SL, TP).
+//                Ein Plan pro Sweep. Entstehen vor der Berührung weitere FVGs, springt der Plan auf die M5-FVG.
+// 4 Entry      : Obere Kante / Mitte / Untere Kante.  SL: hinter der FVG + Puffer + Spread.
+//                TP: nächstes signifikantes Swing mit Mindest-RR.
+// 5 Ende       : Berührung (TOUCH), Ungültig (TP vor Berührung erreicht oder Zeit abgelaufen).
+//                Danach wird das Ergebnis (TP / SL) verfolgt und als Historie gezeigt.
+// Trend        : Gegen-Trend-Setups werden nur markiert, Alarme nur für Mit-Trend-Setups.
+// Alle Signale nur auf Kerzenschluss. Zeiten: Europe/Vienna.
+// =====================================================================
+
+// ---------- Typ für einen Plan ----------
+type Plan
+    int dir
+    float top
+    float bot
+    float entry
+    float sl
+    float tp
+    float rr
+    float fvgSz
+    int birth
+    int sweepBar
+    int sweepTime
+    int winEnd
+    string kind
+    string grade
+    string sess
+    bool eq
+    bool h4ok
+    bool withTrend = true
+    bool strong = false
+    int state = 0
+    int result = 0
+    int touchBar
+    int endBar
+    int endTime
+    bool nearArmed = false
+    bool nearSent = false
+    int extra = 0
+    bool jumped = false
+    line lnE
+    line lnS
+    line lnT
+    line lnFt
+    line lnFb
+    line ln1R
+    label lbP
+
+// ---------- Eingaben ----------
+string G_P = "Zeitrahmen-Profil"
+string profileSel = input.string("Auto", "Profil", options = ["Auto", "Manuell"], group = G_P, tooltip = "Auto wählt die Startwerte nach dem Chart-Zeitrahmen (M1, M2, M5; höhere Zeitrahmen nutzen das M5-Profil). Bei 'Manuell' gelten die Werte der Gruppe 'Manuelle Werte'.")
+
+string G_TR = "Trend-Filter (Strukturbruch)"
+string trendMode = input.string("H1", "Trend-Filter", options = ["Aus", "M5", "M15", "H1", "H4"], group = G_TR, tooltip = "Setups in Trendrichtung sind Mit-Trend-Setups. Setups gegen den Trend (oder bei neutralem Trend) werden NICHT gesperrt, sondern als 'GEGEN-TREND' markiert und lösen keine Alarme aus. Trend = Strukturbruch: aufwärts, sobald eine abgeschlossene Kerze über das letzte Swing-Hoch schließt, abwärts, sobald sie unter das letzte Swing-Tief schließt. 'Aus' = alle Setups gelten als Mit-Trend.")
+int trendPivot = input.int(5, "Pivot-Stärke für den Trend (Kerzen je Seite)", minval = 1, group = G_TR, tooltip = "Gilt nur für die Trendbestimmung im Trend-Zeitrahmen. Die Pivot-Stärke der Setup-Swings (Liquidität) wird getrennt davon über das Profil bzw. 'Swing-Pivot-Stärke' eingestellt.")
+bool showCounter = input.bool(true, "Gegen-Trend-Setups im Chart anzeigen (markiert, ohne Alarm)", group = G_TR)
+bool showTrend = input.bool(true, "Trend als Streifen am unteren Rand anzeigen", group = G_TR)
+bool trendWarn = input.bool(true, "Warnung, wenn der Trend-Zeitrahmen kleiner als der Chart ist", group = G_TR)
+
+string G_S = "Liquidität & Sweep"
+string sweepKind = input.string("Beide", "Sweep-Art", options = ["Beide", "Nur Grab", "Nur Sweep"], group = G_S, tooltip = "Grab: Kerze nimmt das Level und schließt wieder dahinter. Sweep: Der Preis bleibt mindestens die Mindestdauer jenseits des Levels und kehrt dann zurück.")
+int sweepMinMin = input.int(6, "Sweep: Mindestdauer jenseits des Levels (Minuten)", minval = 2, group = G_S)
+int sweepMaxMin = input.int(30, "Sweep: Höchstdauer (Minuten, danach = echter Ausbruch)", minval = 5, group = G_S)
+float eqTolAtr = input.float(0.1, "Gleiche Hochs/Tiefs: Toleranz (× ATR) → Stern", minval = 0.0, step = 0.05, group = G_S)
+int maxLevels = input.int(10, "Max. gemerkte Swing-Levels je Seite", minval = 2, group = G_S)
+int atrLen = input.int(14, "ATR-Länge", minval = 1, group = G_S)
+int closeBackN = input.int(3, "Close-Back: Kerzen bis zum Schluss zurück im Level (Grab)", minval = 1, maxval = 10, group = G_S, tooltip = "Grab gilt nur, wenn eine Kerze innerhalb von 1 bis N Kerzen (die Stich-Kerze zählt als 1) wieder innerhalb des Levels schließt.")
+float depthMinAtr = input.float(0.1, "Sweep-Tiefe: Minimum (× ATR)", minval = 0.0, step = 0.05, group = G_S, tooltip = "Wie weit der Preis mindestens über/unter das Level stechen muss.")
+float depthMaxAtr = input.float(1.0, "Sweep-Tiefe: Maximum (× ATR)", minval = 0.05, step = 0.05, group = G_S, tooltip = "Sticht der Preis weiter, gilt es als echter Ausbruch. Das Level ist trotzdem verbraucht.")
+bool reactOn = input.bool(true, "Reaktion nach dem Sweep verlangen", group = G_S)
+float dispAtr = input.float(0.7, "Reaktion: Körper der Verdrängungskerze (× ATR)", minval = 0.0, step = 0.05, group = G_S, tooltip = "Nach dem Close-Back muss eine Kerze in Gegenrichtung mit mindestens diesem Körper kommen (die Close-Back-Kerze zählt mit). Erst danach wird die erste FVG zum Plan.")
+float strongMult = input.float(2.0, "Starkes Level ab Stärke", minval = 1.0, step = 0.1, group = G_S, tooltip = "Stärke = Ausschlag des Swings / Mindest-Ausschlag, +1 bei gleichen Hochs/Tiefs. Werden mehrere Levels gleichzeitig genommen, zählt das stärkste. Ein starkes Level gibt +1 Punkt für die Note.")
+bool strongOnly = input.bool(false, "Nur starke Levels handeln", group = G_S)
+bool showSweepLine = input.bool(true, "Gesweepte Level als gepunktete Linie", group = G_S)
+
+string G_R = "Entry, SL & TP"
+string entryMode = input.string("Mitte", "Einstieg in der FVG", options = ["Obere Kante", "Mitte", "Untere Kante"], group = G_R, tooltip = "Obere Kante = der höhere Preis der FVG, Untere Kante = der niedrigere Preis (unabhängig von Long oder Short).")
+float spreadPts = input.float(0.0, "Spread (Preis-Einheiten), wird zum SL-Abstand addiert", minval = 0.0, step = 0.1, group = G_R, tooltip = "Der Chart zeigt den Bid-Kurs. Trage hier den typischen Spread deines Brokers (Pepperstone) für diesen Markt ein.")
+
+string G_M = "Manuelle Werte (nur bei Profil 'Manuell')"
+int swingMin = input.int(25, "Swing-Pivot-Stärke (Minuten je Seite)", minval = 5, group = G_M)
+float swingMinAtr = input.float(1.0, "Mindest-Ausschlag des Swings (× ATR)", minval = 0.0, step = 0.1, group = G_M)
+int levelMaxAgeMin = input.int(1440, "Max. Alter eines Swing-Levels (Minuten)", minval = 60, group = G_M)
+float fvgMinAtr = input.float(0.2, "Min. FVG-Größe (× ATR)", minval = 0.0, step = 0.05, group = G_M)
+float slBufAtr = input.float(0.15, "SL-Puffer hinter der FVG (× ATR)", minval = 0.0, step = 0.05, group = G_M)
+float minSlAtr = input.float(0.3, "Mindest-SL-Abstand (× ATR)", minval = 0.0, step = 0.1, group = G_M)
+float minRR = input.float(1.5, "Mindest-RR (TP = nächstes signifikantes Swing)", minval = 0.5, step = 0.1, group = G_M)
+int waitFvgMin = input.int(100, "Zeitfenster nach dem Sweep für die FVG (Minuten)", minval = 5, group = G_M)
+int waitReturnMin = input.int(150, "Max. Minuten von der FVG bis zum Rücklauf", minval = 5, group = G_M)
+int maxPlansIn = input.int(3, "Max. gleichzeitig offene Pläne", minval = 1, maxval = 10, group = G_M)
+
+string G_A = "Alarme"
+string alertFmt = input.string("Klartext", "Alarm-Format (bei 'Any alert() function call')", options = ["Klartext", "JSON", "Beides"], group = G_A, tooltip = "Klartext = lesbare Meldung fürs Handy. JSON = für Webhook / Bot. Beides sendet zwei Meldungen.")
+string minGrade = input.string("C", "Alarme erst ab Note", options = ["C", "B", "A"], group = G_A)
+bool nearOn = input.bool(true, "Nähe-Alarm vor dem Entry", group = G_A)
+float nearAtr = input.float(0.5, "Nähe-Alarm: Abstand zum Entry (× ATR)", minval = 0.05, step = 0.05, group = G_A)
+
+string G_H = "Historie"
+bool showHist = input.bool(true, "Historie anzeigen (abgeschlossene Pläne bleiben im Chart)", group = G_H, tooltip = "An: abgeschlossene Pläne bleiben sichtbar (grün = TP, rot = SL, grau = nie gefüllt). Aus: sie verschwinden nach der eingestellten Zeit.")
+int maxHist = input.int(50, "Max. Anzahl abgeschlossener Pläne in der Historie", minval = 1, maxval = 80, group = G_H, tooltip = "TradingView erlaubt höchstens 500 Linien. Ein Plan braucht bis zu 6 Linien.")
+int fadeMin = input.int(30, "Historie aus: Pläne entfernen nach (Minuten)", minval = 1, group = G_H)
+
+string G_SS = "Sessions (nur als Info im Etikett)"
+string sessAsia = input.session("0000-0700", "Asia", group = G_SS)
+string sessLon = input.session("0700-1300", "London", group = G_SS)
+string sessNy = input.session("1300-2200", "New York", group = G_SS)
+
+string G_L = "Lot-Rechner & Statistik (Tabelle)"
+bool showLot = input.bool(false, "Zeile 'Lot-Rechner' anzeigen", group = G_L)
+float account = input.float(10000.0, "Kontogröße", minval = 1.0, group = G_L)
+float riskPct = input.float(0.5, "Risiko pro Trade (%)", minval = 0.01, step = 0.1, group = G_L, tooltip = "Näherungswert über den Punktwert des Symbols. Vor dem Handel mit dem Lot-Rechner deines Brokers (Pepperstone) gegenprüfen.")
+bool showStats = input.bool(false, "Zeile 'Statistik' anzeigen", group = G_L)
+
+string G_D = "Darstellung"
+bool showStages = input.bool(true, "Sweep-Markierung (SSL / BSL)", group = G_D)
+bool showSignals = input.bool(true, "Pläne mit Entry / SL / TP", group = G_D)
+bool showFvg = input.bool(true, "FVG-Linien (Ober-/Unterkante)", group = G_D)
+bool show1R = input.bool(true, "1R-Linie (Break-even-Hinweis)", group = G_D)
+bool showStatus = input.bool(true, "Status-Tabelle", group = G_D)
+string tblSizeIn = input.string("small", "Tabellengröße", options = ["tiny", "small", "normal", "large", "huge"], group = G_D)
+
+string G_C = "Farben (Linien, Labels, Tabelle)"
+color cTblBg = input.color(color.rgb(235, 235, 235), "Tabelle: Hintergrund", group = G_C)
+color cTblHead = input.color(color.rgb(200, 200, 200), "Tabelle: Kopfzeile", group = G_C)
+color cTblText = input.color(color.black, "Tabelle: Schrift", group = G_C)
+color cEntry = input.color(color.gray, "Entry-Linie", group = G_C)
+color cSl = input.color(color.red, "SL-Linie", group = G_C)
+color cTp = input.color(color.green, "TP-Linie", group = G_C)
+color c1R = input.color(color.new(color.gray, 40), "1R-Linie", group = G_C)
+color cFvgLine = input.color(color.aqua, "FVG-Linien", group = G_C)
+color cSweepLine = input.color(color.orange, "Gesweepte Level (gepunktet)", group = G_C)
+color cLblLong = input.color(color.lime, "Label Long", group = G_C)
+color cLblShort = input.color(color.red, "Label Short", group = G_C)
+color cLblText = input.color(color.black, "Label Schrift", group = G_C)
+color cLblCounter = input.color(color.rgb(170, 170, 170), "Label Gegen-Trend", group = G_C)
+color cHistTp = input.color(color.green, "Historie: TP erreicht", group = G_C)
+color cHistSl = input.color(color.red, "Historie: SL getroffen", group = G_C)
+color cHistNone = input.color(color.gray, "Historie: nie gefüllt / offen", group = G_C)
+
+int minGradeV = minGrade == "A" ? 3 : minGrade == "B" ? 2 : 1
+string tblSize = tblSizeIn == "tiny" ? size.tiny : tblSizeIn == "normal" ? size.normal : tblSizeIn == "large" ? size.large : tblSizeIn == "huge" ? size.huge : size.small
+
+// ---------- reine Hilfsfunktionen ----------
+f_bos(int len) =>
+    float bph = ta.pivothigh(high, len, len)
+    float bpl = ta.pivotlow(low, len, len)
+    var float lastH = na
+    var float lastL = na
+    var int bt = 0
+    if not na(bph)
+        lastH := bph
+    if not na(bpl)
+        lastL := bpl
+    if not na(lastH) and close > lastH
+        bt := 1
+    else if not na(lastL) and close < lastL
+        bt := -1
+    bt
+
+f_arrow(int b) =>
+    b == 1 ? "▲" : b == -1 ? "▼" : "–"
+
+f_hasEq(array<float> arr, int idx, float tol) =>
+    bool res = false
+    int q = 0
+    while q < array.size(arr)
+        if q != idx and math.abs(array.get(arr, q) - array.get(arr, idx)) <= tol
+            res := true
+        q += 1
+    res
+
+f_tp(array<float> arr, float entry, float risk, float rrMin, bool isLong) =>
+    float res = na
+    int q = array.size(arr) - 1
+    while q >= 0
+        float v = array.get(arr, q)
+        if isLong
+            if v > entry and (v - entry) / risk >= rrMin
+                res := na(res) ? v : math.min(res, v)
+        else
+            if v < entry and (entry - v) / risk >= rrMin
+                res := na(res) ? v : math.max(res, v)
+        q -= 1
+    res
+
+f_levels(bool isL, float fTop, float fBot, float atrV, string eMode, float buf, float minSl, float minRRv, float spr, array<float> hArr, array<float> lArr) =>
+    float ent = eMode == "Obere Kante" ? fTop : eMode == "Untere Kante" ? fBot : (fTop + fBot) / 2.0
+    float base = isL ? fBot - atrV * buf : fTop + atrV * buf
+    float baseRisk = math.max(math.abs(ent - base), atrV * minSl)
+    float tot = baseRisk + spr
+    float slv = isL ? ent - tot : ent + tot
+    float tpv = isL ? f_tp(hArr, ent, tot, minRRv, true) : f_tp(lArr, ent, tot, minRRv, false)
+    float rrv = na(tpv) ? na : math.abs(tpv - ent) / tot
+    [ent, slv, tpv, rrv]
+
+f_grade(float rr, bool h4ok, bool eq, float fSz, float atrV, bool strong) =>
+    int pts = (rr >= 2.0 ? 1 : 0) + (rr >= 3.0 ? 1 : 0) + (h4ok ? 1 : 0) + (eq ? 1 : 0) + (fSz >= atrV * 0.5 ? 1 : 0) + (strong ? 1 : 0)
+    pts >= 4 ? "A" : pts >= 2 ? "B" : "C"
+
+f_gv(string g) =>
+    g == "A" ? 3 : g == "B" ? 2 : 1
+
+f_x2(line l, int x) =>
+    if not na(l)
+        line.set_x2(l, x)
+    0
+
+f_ly(line l, float y) =>
+    if not na(l)
+        line.set_y1(l, y)
+        line.set_y2(l, y)
+    0
+
+f_col(line l, color c) =>
+    if not na(l)
+        line.set_color(l, c)
+    0
+
+f_dl(line l) =>
+    if not na(l)
+        line.delete(l)
+    0
+
+// ---------- Basiswerte ----------
+bool bc = barstate.isconfirmed
+float atr = nz(ta.atr(atrLen), syminfo.mintick)
+
+int tfSec = timeframe.in_seconds()
+float tfMin = math.max(1.0, tfSec / 60.0)
+bool chartIsM5 = tfSec >= 300
+
+// ---------- Zeitrahmen-Profil ----------
+string profAuto = tfSec <= 60 ? "M1" : tfSec <= 150 ? "M2" : "M5"
+string prof = profileSel == "Auto" ? profAuto : "Manuell"
+
+int pSwingMin = prof == "Manuell" ? swingMin : prof == "M1" ? 30 : prof == "M2" ? 30 : 25
+float pSwingAtr = prof == "Manuell" ? swingMinAtr : prof == "M1" ? 3.0 : prof == "M2" ? 2.0 : 1.0
+int pLevelAge = prof == "Manuell" ? levelMaxAgeMin : 1440
+float pFvgMin = prof == "Manuell" ? fvgMinAtr : prof == "M1" ? 0.4 : prof == "M2" ? 0.3 : 0.2
+float pSlBuf = prof == "Manuell" ? slBufAtr : prof == "M1" ? 0.3 : prof == "M2" ? 0.2 : 0.15
+float pMinSl = prof == "Manuell" ? minSlAtr : prof == "M1" ? 0.7 : prof == "M2" ? 0.5 : 0.3
+float pMinRR = prof == "Manuell" ? minRR : prof == "M1" ? 2.0 : 1.5
+int pWaitFvg = prof == "Manuell" ? waitFvgMin : prof == "M1" ? 30 : prof == "M2" ? 60 : 100
+int pWaitRet = prof == "Manuell" ? waitReturnMin : prof == "M1" ? 45 : prof == "M2" ? 90 : 150
+int pMaxPlans = prof == "Manuell" ? maxPlansIn : 3
+
+int swingLenB = math.max(2, math.round(pSwingMin / tfMin))
+int levelAgeB = math.max(1, math.round(pLevelAge / tfMin))
+int waitFvgB = math.max(3, math.round(pWaitFvg / tfMin))
+int waitRetB = math.max(1, math.round(pWaitRet / tfMin))
+int sweepMinB = math.max(2, math.ceil(sweepMinMin / tfMin))
+int sweepMaxB = math.max(sweepMinB + 1, math.round(sweepMaxMin / tfMin))
+int trackMaxB = math.max(10, math.round(600 / tfMin))
+float fvgMin = atr * pFvgMin
+
+// ---------- Trend (zuletzt abgeschlossene Kerze des jeweiligen Zeitrahmens) ----------
+int trM5 = nz(request.security(syminfo.tickerid, "5", f_bos(trendPivot)[1], lookahead = barmerge.lookahead_on))
+int trM15 = nz(request.security(syminfo.tickerid, "15", f_bos(trendPivot)[1], lookahead = barmerge.lookahead_on))
+int trH1n = nz(request.security(syminfo.tickerid, "60", f_bos(trendPivot)[1], lookahead = barmerge.lookahead_on))
+int trH4n = nz(request.security(syminfo.tickerid, "240", f_bos(trendPivot)[1], lookahead = barmerge.lookahead_on))
+int trend = trendMode == "M5" ? trM5 : trendMode == "M15" ? trM15 : trendMode == "H1" ? trH1n : trendMode == "H4" ? trH4n : 0
+float trendTfMin = trendMode == "M5" ? 5.0 : trendMode == "M15" ? 15.0 : trendMode == "H1" ? 60.0 : trendMode == "H4" ? 240.0 : 0.0
+bool trendTooSmall = trendWarn and trendMode != "Aus" and trendTfMin < tfMin
+
+// ---------- M5-FVGs (zuletzt abgeschlossene M5-Kerze) ----------
+[m5L1, m5H3, m5H1, m5L3, m5T1, m5T3] = request.security(syminfo.tickerid, "5", [low[1], high[3], high[1], low[3], time[1], time[3]], lookahead = barmerge.lookahead_on)
+bool m5New = not na(m5T1) and m5T1 != nz(m5T1[1])
+
+var float m5bTop = na
+var float m5bBot = na
+var int m5bT1 = na
+var int m5bT3 = na
+var float m5sTop = na
+var float m5sBot = na
+var int m5sT1 = na
+var int m5sT3 = na
+if bc and m5New
+    if m5L1 > m5H3 and m5L1 - m5H3 >= fvgMin
+        m5bTop := m5L1
+        m5bBot := m5H3
+        m5bT1 := m5T1
+        m5bT3 := m5T3
+    if m5L3 > m5H1 and m5L3 - m5H1 >= fvgMin
+        m5sTop := m5L3
+        m5sBot := m5H1
+        m5sT1 := m5T1
+        m5sT3 := m5T3
+
+// ---------- Sessions (Info) ----------
+bool inAsia = not na(time(timeframe.period, sessAsia, "Europe/Vienna"))
+bool inLon = not na(time(timeframe.period, sessLon, "Europe/Vienna"))
+bool inNy = not na(time(timeframe.period, sessNy, "Europe/Vienna"))
+string sessNow = inLon ? "London" : inNy ? "NY" : inAsia ? "Asia" : "Spät"
+
+// ---------- Funktionen mit Zugriff auf Eingaben ----------
+f_planTxt(Plan p) =>
+    (p.withTrend ? "" : "⚠ GEGEN-TREND | ") + (p.dir == 1 ? "FVG-LONG" : "FVG-SHORT") + (p.strong ? " | Level stark" : "") + " | RR " + str.tostring(p.rr, "#.0") + " | " + p.grade + " | " + p.sess + " | " + (p.h4ok ? "H4 ✓" : "H4 ✗")
+
+f_planDraw(Plan p) =>
+    int x = bar_index
+    if showSignals
+        p.lnE := line.new(x, p.entry, x + 1, p.entry, color = cEntry, style = line.style_dashed)
+        p.lnS := line.new(x, p.sl, x + 1, p.sl, color = cSl)
+        p.lnT := line.new(x, p.tp, x + 1, p.tp, color = cTp)
+        p.lbP := label.new(x, p.entry, f_planTxt(p), style = p.dir == 1 ? label.style_label_up : label.style_label_down, color = not p.withTrend ? cLblCounter : p.dir == 1 ? cLblLong : cLblShort, textcolor = cLblText, size = size.tiny)
+        if show1R
+            float oneR = p.dir == 1 ? p.entry + math.abs(p.entry - p.sl) : p.entry - math.abs(p.entry - p.sl)
+            p.ln1R := line.new(x, oneR, x + 1, oneR, color = c1R, style = line.style_dotted)
+    if showFvg
+        p.lnFt := line.new(x, p.top, x + 1, p.top, color = cFvgLine)
+        p.lnFb := line.new(x, p.bot, x + 1, p.bot, color = cFvgLine)
+    0
+
+f_planMove(Plan p) =>
+    f_ly(p.lnE, p.entry)
+    f_ly(p.lnS, p.sl)
+    f_ly(p.lnT, p.tp)
+    f_ly(p.lnFt, p.top)
+    f_ly(p.lnFb, p.bot)
+    float oneR = p.dir == 1 ? p.entry + math.abs(p.entry - p.sl) : p.entry - math.abs(p.entry - p.sl)
+    f_ly(p.ln1R, oneR)
+    if not na(p.lbP)
+        label.set_y(p.lbP, p.entry)
+        label.set_text(p.lbP, f_planTxt(p))
+    0
+
+f_planExt(Plan p, int x) =>
+    f_x2(p.lnE, x)
+    f_x2(p.lnS, x)
+    f_x2(p.lnT, x)
+    f_x2(p.lnFt, x)
+    f_x2(p.lnFb, x)
+    f_x2(p.ln1R, x)
+    0
+
+f_planDel(Plan p) =>
+    f_dl(p.lnE)
+    f_dl(p.lnS)
+    f_dl(p.lnT)
+    f_dl(p.lnFt)
+    f_dl(p.lnFb)
+    f_dl(p.ln1R)
+    if not na(p.lbP)
+        label.delete(p.lbP)
+    0
+
+f_finish(Plan p, int res, array<int> stArr) =>
+    p.state := 2
+    p.result := res
+    p.endBar := bar_index
+    p.endTime := time
+    color c = res == 1 ? cHistTp : res == -1 ? cHistSl : cHistNone
+    f_col(p.lnE, c)
+    f_col(p.lnS, c)
+    f_col(p.lnT, c)
+    f_col(p.lnFt, color.new(c, 40))
+    f_col(p.lnFb, color.new(c, 40))
+    f_col(p.ln1R, color.new(c, 60))
+    f_x2(p.lnE, bar_index)
+    f_x2(p.lnS, bar_index)
+    f_x2(p.lnT, bar_index)
+    f_x2(p.lnFt, bar_index)
+    f_x2(p.lnFb, bar_index)
+    f_x2(p.ln1R, bar_index)
+    if not na(p.lbP)
+        label.set_color(p.lbP, c)
+    int b = p.kind == "Grab" ? 0 : 4
+    if res == 1
+        array.set(stArr, b + 2, array.get(stArr, b + 2) + 1)
+    else if res == -1
+        array.set(stArr, b + 3, array.get(stArr, b + 3) + 1)
+    0
+
+f_txt(string evt, Plan p) =>
+    string et = evt == "SETUP" ? "Setup bereit" : evt == "UPDATE" ? "Plan auf M5-FVG verschoben" : evt == "NEAR" ? "Preis nähert sich dem Entry" : evt == "TOUCH" ? "Limit berührt" : "ungültig - Limit löschen"
+    syminfo.ticker + " " + (p.dir == 1 ? "LONG" : "SHORT") + " " + et + " | Limit " + str.tostring(p.entry, format.mintick) + " | SL " + str.tostring(p.sl, format.mintick) + " | TP " + str.tostring(p.tp, format.mintick) + " | RR " + str.tostring(p.rr, "#.0") + " | Note " + p.grade
+
+f_json(string evt, Plan p) =>
+    '{"event":"' + evt + '","side":"' + (p.dir == 1 ? "BUY" : "SELL") + '","symbol":"' + syminfo.ticker + '","entry":' + str.tostring(p.entry, format.mintick) + ',"sl":' + str.tostring(p.sl, format.mintick) + ',"tp":' + str.tostring(p.tp, format.mintick) + ',"rr":' + str.tostring(p.rr, "#.0") + ',"grade":"' + p.grade + '","kind":"' + p.kind + '"}'
+
+f_send(string evt, Plan p) =>
+    if p.withTrend and f_gv(p.grade) >= minGradeV
+        if alertFmt != "JSON"
+            alert(f_txt(evt, p), alert.freq_all)
+        if alertFmt != "Klartext"
+            alert(f_json(evt, p), alert.freq_all)
+    0
+
+// ---------- Relevante Swings (Liquidität) ----------
+var array<float> hP = array.new<float>()
+var array<int> hB = array.new<int>()
+var array<float> lP = array.new<float>()
+var array<int> lB = array.new<int>()
+var array<float> hS = array.new<float>()
+var array<float> lS = array.new<float>()
+
+float ph = ta.pivothigh(high, swingLenB, swingLenB)
+float pl = ta.pivotlow(low, swingLenB, swingLenB)
+float hiWin = ta.highest(high, 2 * swingLenB + 1)
+float loWin = ta.lowest(low, 2 * swingLenB + 1)
+
+// ---------- Level-Aufnahme: welche Levels nimmt diese Kerze? (nur das zuletzt genommene zählt) ----------
+// Gewichtung: Stärke = Ausschlag / Mindest-Ausschlag (+1 bei gleichen Hochs/Tiefs). Das stärkste genommene Level zählt.
+float tkLowLvl = na
+int tkLowBar = na
+bool tkLowEq = false
+float tkLowStr = na
+float tkHighLvl = na
+int tkHighBar = na
+bool tkHighEq = false
+float tkHighStr = na
+
+if bc
+    float eqTol = atr * eqTolAtr
+    int a1 = 0
+    while a1 < array.size(lP)
+        float lvA = array.get(lP, a1)
+        if low < lvA
+            bool eqA = f_hasEq(lP, a1, eqTol)
+            float sA = array.get(lS, a1) + (eqA ? 1.0 : 0.0)
+            if na(tkLowStr) or sA > tkLowStr or (sA == tkLowStr and lvA < tkLowLvl)
+                tkLowLvl := lvA
+                tkLowBar := array.get(lB, a1)
+                tkLowEq := eqA
+                tkLowStr := sA
+        a1 += 1
+    int a2 = 0
+    while a2 < array.size(hP)
+        float lvB = array.get(hP, a2)
+        if high > lvB
+            bool eqB = f_hasEq(hP, a2, eqTol)
+            float sB = array.get(hS, a2) + (eqB ? 1.0 : 0.0)
+            if na(tkHighStr) or sB > tkHighStr or (sB == tkHighStr and lvB > tkHighLvl)
+                tkHighLvl := lvB
+                tkHighBar := array.get(hB, a2)
+                tkHighEq := eqB
+                tkHighStr := sB
+        a2 += 1
+    // abgeholte Levels sind verbraucht (auch wenn daraus kein gültiger Sweep wird), alte Levels laufen ab
+    int r1 = array.size(lP) - 1
+    while r1 >= 0
+        if low < array.get(lP, r1) or bar_index - array.get(lB, r1) > levelAgeB
+            array.remove(lP, r1)
+            array.remove(lB, r1)
+            array.remove(lS, r1)
+        r1 -= 1
+    int r2 = array.size(hP) - 1
+    while r2 >= 0
+        if high > array.get(hP, r2) or bar_index - array.get(hB, r2) > levelAgeB
+            array.remove(hP, r2)
+            array.remove(hB, r2)
+            array.remove(hS, r2)
+        r2 -= 1
+
+// ---------- Neue signifikante Swings aufnehmen ----------
+if bc and not na(ph) and ph - loWin >= pSwingAtr * atr
+    array.push(hP, ph)
+    array.push(hB, bar_index - swingLenB)
+    array.push(hS, (ph - loWin) / math.max(pSwingAtr * atr, syminfo.mintick))
+    if array.size(hP) > maxLevels
+        array.shift(hP)
+        array.shift(hB)
+        array.shift(hS)
+if bc and not na(pl) and hiWin - pl >= pSwingAtr * atr
+    array.push(lP, pl)
+    array.push(lB, bar_index - swingLenB)
+    array.push(lS, (hiWin - pl) / math.max(pSwingAtr * atr, syminfo.mintick))
+    if array.size(lP) > maxLevels
+        array.shift(lP)
+        array.shift(lB)
+        array.shift(lS)
+
+// =====================================================================
+// SWEEP-ZUSTAND: 0 = wartet, 1 = Sweep läuft (Preis jenseits des Levels), 2 = Sweep fertig, Reaktion + FVG abwarten
+// =====================================================================
+var int phase = 0
+var int sdir = 0
+var float swLevel = na
+var float swExt = na
+var int swStartBar = na
+var int swCompBar = na
+var int swCompTime = na
+var string swKind = ""
+var bool swEq = false
+var bool swStrong = false
+var int swLvBar = na
+var string swSess = ""
+var bool swReact = false
+
+bool sweepDone = false
+bool kindGrabOk = sweepKind != "Nur Sweep"
+bool kindSweepOk = sweepKind != "Nur Grab"
+float dMin = atr * depthMinAtr
+float dMax = atr * depthMaxAtr
+
+if bc
+    if phase == 1
+        bool back = sdir == 1 ? close > swLevel : close < swLevel
+        swExt := sdir == 1 ? math.min(swExt, low) : math.max(swExt, high)
+        float depth = sdir == 1 ? swLevel - swExt : swExt - swLevel
+        if bar_index - swStartBar > sweepMaxB or depth > dMax
+            phase := 0
+        else if back
+            int nBeyond = bar_index - swStartBar
+            // Grab: Close zurück innerhalb von 1..N Kerzen (Stich-Kerze = 1). Sweep: mind. Mindestdauer jenseits.
+            string kd = nBeyond < closeBackN ? "Grab" : nBeyond >= sweepMinB ? "Sweep" : ""
+            bool kOk = kd == "Grab" ? kindGrabOk : kd == "Sweep" ? kindSweepOk : false
+            if kOk and depth >= dMin
+                phase := 2
+                swKind := kd
+                swCompBar := bar_index
+                swCompTime := time
+                swReact := false
+                sweepDone := true
+            else
+                phase := 0
+    else if phase == 0
+        bool tkL = not na(tkLowLvl) and (not strongOnly or tkLowStr >= strongMult)
+        bool tkH = not na(tkHighLvl) and (not strongOnly or tkHighStr >= strongMult)
+        bool both = not na(tkLowLvl) and not na(tkHighLvl)
+        if tkL and not both
+            bool backNow = close > tkLowLvl
+            float dep = tkLowLvl - low
+            bool okNow = backNow ? kindGrabOk and dep >= dMin and dep <= dMax : dep <= dMax
+            if okNow
+                sdir := 1
+                swLevel := tkLowLvl
+                swExt := low
+                swStartBar := bar_index
+                swLvBar := tkLowBar
+                swEq := tkLowEq
+                swStrong := tkLowStr >= strongMult
+                swSess := sessNow
+                if backNow
+                    phase := 2
+                    swKind := "Grab"
+                    swCompBar := bar_index
+                    swCompTime := time
+                    swReact := false
+                    sweepDone := true
+                else
+                    phase := 1
+        else if tkH and not both
+            bool backNow2 = close < tkHighLvl
+            float dep2 = high - tkHighLvl
+            bool okNow2 = backNow2 ? kindGrabOk and dep2 >= dMin and dep2 <= dMax : dep2 <= dMax
+            if okNow2
+                sdir := -1
+                swLevel := tkHighLvl
+                swExt := high
+                swStartBar := bar_index
+                swLvBar := tkHighBar
+                swEq := tkHighEq
+                swStrong := tkHighStr >= strongMult
+                swSess := sessNow
+                if backNow2
+                    phase := 2
+                    swKind := "Grab"
+                    swCompBar := bar_index
+                    swCompTime := time
+                    swReact := false
+                    sweepDone := true
+                else
+                    phase := 1
+
+// Reaktion: Verdrängungskerze in Gegenrichtung (ab der Close-Back-Kerze)
+if bc and phase == 2 and not swReact
+    float body = sdir == 1 ? close - open : open - close
+    if not reactOn or body >= dispAtr * atr
+        swReact := true
+
+// Trend-Status des Sweeps, festgehalten beim Close-Back (nur Markierung, keine Sperre)
+var bool swWithTrend = true
+if sweepDone
+    swWithTrend := trendMode == "Aus" or trend == sdir
+
+var array<line> swLines = array.new<line>()
+if sweepDone and showSweepLine
+    array.push(swLines, line.new(swLvBar, swLevel, bar_index, swLevel, color = cSweepLine, style = line.style_dotted))
+    if array.size(swLines) > 30
+        line.delete(array.shift(swLines))
+
+// =====================================================================
+// PLÄNE
+// =====================================================================
+var array<Plan> plans = array.new<Plan>()
+var array<int> st = array.new<int>(8, 0)
+
+bool fvgBullNow = low > high[2] and low - high[2] >= fvgMin
+bool fvgBearNow = high < low[2] and low[2] - high >= fvgMin
+
+bool apNewL = false
+bool apNewS = false
+bool apUpd = false
+bool apNear = false
+bool apTouchL = false
+bool apTouchS = false
+bool apCancel = false
+bool dpCntL = false
+bool dpCntS = false
+int finCnt = 0
+
+// ---------- bestehende Pläne verwalten ----------
+if bc
+    int k = array.size(plans) - 1
+    while k >= 0
+        Plan p = array.get(plans, k)
+        bool isL = p.dir == 1
+        bool gk = p.withTrend and f_gv(p.grade) >= minGradeV
+        bool delIt = false
+        if p.state == 0 and bar_index > p.birth
+            bool touch = isL ? low <= p.entry : high >= p.entry
+            bool tpFirst = isL ? high >= p.tp : low <= p.tp
+            bool expired = bar_index - p.birth > waitRetB
+            if touch
+                p.state := 1
+                p.touchBar := bar_index
+                int bt0 = p.kind == "Grab" ? 0 : 4
+                array.set(st, bt0 + 1, array.get(st, bt0 + 1) + 1)
+                if gk
+                    if isL
+                        apTouchL := true
+                    else
+                        apTouchS := true
+                f_send("TOUCH", p)
+                bool slNow = isL ? low <= p.sl : high >= p.sl
+                if slNow
+                    f_finish(p, -1, st)
+                else
+                    f_planExt(p, bar_index + 1)
+            else if tpFirst or expired
+                if gk
+                    apCancel := true
+                f_send("CANCEL", p)
+                f_finish(p, 0, st)
+            else
+                float dist = isL ? close - p.entry : p.entry - close
+                if nearOn
+                    if dist > nearAtr * atr
+                        p.nearArmed := true
+                    else if p.nearArmed and not p.nearSent and dist > 0
+                        p.nearSent := true
+                        if gk
+                            apNear := true
+                        f_send("NEAR", p)
+                if not chartIsM5 and not p.jumped
+                    bool nf = isL ? fvgBullNow : fvgBearNow
+                    if nf and bar_index - 2 >= p.sweepBar and bar_index <= p.winEnd
+                        p.extra += 1
+                    if p.extra >= 1
+                        float zT = isL ? m5bTop : m5sTop
+                        float zB = isL ? m5bBot : m5sBot
+                        int zT1 = isL ? m5bT1 : m5sT1
+                        int zT3 = isL ? m5bT3 : m5sT3
+                        bool zOk = not na(zT) and not na(zT3) and not na(zT1)
+                        if zOk
+                            zOk := zT3 + 300000 > p.sweepTime and zT1 <= p.sweepTime + pWaitFvg * 60000
+                        if zOk
+                            zOk := math.abs(zT - p.top) > syminfo.mintick or math.abs(zB - p.bot) > syminfo.mintick
+                        if zOk
+                            zOk := isL ? close > zB : close < zT
+                        if zOk
+                            [jE, jS, jT, jR] = f_levels(isL, zT, zB, atr, entryMode, pSlBuf, pMinSl, pMinRR, spreadPts, hP, lP)
+                            if not na(jT) and (isL ? close > jE : close < jE)
+                                p.top := zT
+                                p.bot := zB
+                                p.entry := jE
+                                p.sl := jS
+                                p.tp := jT
+                                p.rr := jR
+                                p.fvgSz := zT - zB
+                                p.grade := f_grade(jR, p.h4ok, p.eq, p.fvgSz, atr, p.strong)
+                                f_planMove(p)
+                                apUpd := apUpd or gk
+                                f_send("UPDATE", p)
+                            p.jumped := true
+                f_planExt(p, bar_index + 1)
+        else if p.state == 1 and bar_index > p.touchBar
+            bool slHit = isL ? low <= p.sl : high >= p.sl
+            bool tpHit = isL ? high >= p.tp : low <= p.tp
+            if slHit
+                f_finish(p, -1, st)
+            else if tpHit
+                f_finish(p, 1, st)
+            else if bar_index - p.touchBar > trackMaxB
+                f_finish(p, 0, st)
+            else
+                f_planExt(p, bar_index + 1)
+        else if p.state == 2
+            finCnt += 1
+            if showHist
+                delIt := finCnt > maxHist
+            else
+                delIt := time - p.endTime > fadeMin * 60000
+        if delIt
+            f_planDel(p)
+            array.remove(plans, k)
+        k -= 1
+
+// ---------- neuen Plan aus der ersten FVG nach dem Sweep ----------
+if bc and phase == 2
+    if bar_index - swCompBar > waitFvgB
+        phase := 0
+    else if bar_index - 2 >= swCompBar and swReact
+        bool isLn = sdir == 1
+        bool fv = isLn ? fvgBullNow : fvgBearNow
+        if fv and not swWithTrend and not showCounter
+            phase := 0
+        else if fv
+            float fTop = isLn ? low : low[2]
+            float fBot = isLn ? high[2] : high
+            [nE, nS, nT, nR] = f_levels(isLn, fTop, fBot, atr, entryMode, pSlBuf, pMinSl, pMinRR, spreadPts, hP, lP)
+            if not na(nT)
+                bool h4n = trH4n == sdir
+                string gr = f_grade(nR, h4n, swEq, fTop - fBot, atr, swStrong)
+                Plan np = Plan.new(dir = sdir, top = fTop, bot = fBot, entry = nE, sl = nS, tp = nT, rr = nR, fvgSz = fTop - fBot, birth = bar_index, sweepBar = swCompBar, sweepTime = swCompTime, winEnd = swCompBar + waitFvgB, kind = swKind, grade = gr, sess = swSess, eq = swEq, h4ok = h4n, withTrend = swWithTrend, strong = swStrong)
+                np.nearArmed := (isLn ? close - nE : nE - close) > nearAtr * atr
+                f_planDraw(np)
+                array.push(plans, np)
+                int bn = swKind == "Grab" ? 0 : 4
+                array.set(st, bn, array.get(st, bn) + 1)
+                if swWithTrend and f_gv(gr) >= minGradeV
+                    if isLn
+                        apNewL := true
+                    else
+                        apNewS := true
+                if not swWithTrend
+                    if isLn
+                        dpCntL := true
+                    else
+                        dpCntS := true
+                f_send("SETUP", np)
+                int pendCnt = 0
+                int ci = 0
+                while ci < array.size(plans)
+                    Plan pc = array.get(plans, ci)
+                    if pc.state == 0
+                        pendCnt += 1
+                    ci += 1
+                // zu viele offene Pläne: zuerst die ältesten Gegen-Trend-Pläne beenden, dann die ältesten übrigen
+                int pss = 0
+                while pss < 2
+                    int di = 0
+                    while pendCnt > pMaxPlans and di < array.size(plans)
+                        Plan op = array.get(plans, di)
+                        if op.state == 0 and (pss == 1 or not op.withTrend)
+                            f_send("CANCEL", op)
+                            f_finish(op, 0, st)
+                            pendCnt -= 1
+                        di += 1
+                    pss += 1
+            phase := 0
+
+// =====================================================================
+// DARSTELLUNG
+// =====================================================================
+bool mkSslG = showStages and sweepDone and sdir == 1 and swKind == "Grab" and not swEq
+bool mkSslGe = showStages and sweepDone and sdir == 1 and swKind == "Grab" and swEq
+bool mkSslS = showStages and sweepDone and sdir == 1 and swKind == "Sweep" and not swEq
+bool mkSslSe = showStages and sweepDone and sdir == 1 and swKind == "Sweep" and swEq
+bool mkBslG = showStages and sweepDone and sdir == -1 and swKind == "Grab" and not swEq
+bool mkBslGe = showStages and sweepDone and sdir == -1 and swKind == "Grab" and swEq
+bool mkBslS = showStages and sweepDone and sdir == -1 and swKind == "Sweep" and not swEq
+bool mkBslSe = showStages and sweepDone and sdir == -1 and swKind == "Sweep" and swEq
+
+plotshape(mkSslG, "SSL Grab", style = shape.triangleup, location = location.belowbar, color = color.lime, text = "SSL Grab", textcolor = color.black, size = size.tiny)
+plotshape(mkSslGe, "SSL Grab (gleiche Tiefs)", style = shape.triangleup, location = location.belowbar, color = color.lime, text = "SSL Grab ★", textcolor = color.black, size = size.tiny)
+plotshape(mkSslS, "SSL Sweep", style = shape.triangleup, location = location.belowbar, color = color.lime, text = "SSL Sweep", textcolor = color.black, size = size.tiny)
+plotshape(mkSslSe, "SSL Sweep (gleiche Tiefs)", style = shape.triangleup, location = location.belowbar, color = color.lime, text = "SSL Sweep ★", textcolor = color.black, size = size.tiny)
+plotshape(mkBslG, "BSL Grab", style = shape.triangledown, location = location.abovebar, color = color.red, text = "BSL Grab", textcolor = color.black, size = size.tiny)
+plotshape(mkBslGe, "BSL Grab (gleiche Hochs)", style = shape.triangledown, location = location.abovebar, color = color.red, text = "BSL Grab ★", textcolor = color.black, size = size.tiny)
+plotshape(mkBslS, "BSL Sweep", style = shape.triangledown, location = location.abovebar, color = color.red, text = "BSL Sweep", textcolor = color.black, size = size.tiny)
+plotshape(mkBslSe, "BSL Sweep (gleiche Hochs)", style = shape.triangledown, location = location.abovebar, color = color.red, text = "BSL Sweep ★", textcolor = color.black, size = size.tiny)
+
+plotshape(showSignals and apNewL, "Plan bereit Long", style = shape.labelup, location = location.belowbar, color = color.new(color.yellow, 10), text = "LIMIT", textcolor = color.black, size = size.tiny)
+plotshape(showSignals and apNewS, "Plan bereit Short", style = shape.labeldown, location = location.abovebar, color = color.new(color.yellow, 10), text = "LIMIT", textcolor = color.black, size = size.tiny)
+plotshape(showSignals and dpCntL, "Plan Gegen-Trend Long", style = shape.labelup, location = location.belowbar, color = cLblCounter, text = "LIMIT ⚠", textcolor = color.black, size = size.tiny)
+plotshape(showSignals and dpCntS, "Plan Gegen-Trend Short", style = shape.labeldown, location = location.abovebar, color = cLblCounter, text = "LIMIT ⚠", textcolor = color.black, size = size.tiny)
+plotshape(showSignals and apTouchL, "Long: Level berührt", style = shape.labelup, location = location.belowbar, color = color.lime, text = "LONG", textcolor = color.black, size = size.small)
+plotshape(showSignals and apTouchS, "Short: Level berührt", style = shape.labeldown, location = location.abovebar, color = color.red, text = "SHORT", textcolor = color.black, size = size.small)
+
+plotchar(showTrend and trendMode != "Aus" and trend == 1, "Trend aufwärts", char = "■", location = location.bottom, color = color.new(color.green, 30), size = size.tiny)
+plotchar(showTrend and trendMode != "Aus" and trend == -1, "Trend abwärts", char = "■", location = location.bottom, color = color.new(color.red, 30), size = size.tiny)
+
+// ---------- Alarmbedingungen (für feste Alarme je Ereignis) ----------
+alertcondition(apNewL, "Plan LONG bereit", "LONG-Plan: Entry, SL und TP im Chart")
+alertcondition(apNewS, "Plan SHORT bereit", "SHORT-Plan: Entry, SL und TP im Chart")
+alertcondition(apUpd, "Plan auf M5-FVG verschoben", "Plan aktualisiert: Limit-Order anpassen")
+alertcondition(apNear, "Preis nähert sich dem Entry", "Preis nähert sich dem Limit-Level")
+alertcondition(apTouchL, "Plan LONG: Level berührt", "LONG: Limit-Level berührt")
+alertcondition(apTouchS, "Plan SHORT: Level berührt", "SHORT: Limit-Level berührt")
+alertcondition(apCancel, "Plan ungültig", "Plan ungültig: Limit-Order löschen")
+
+// ---------- Status-Tabelle ----------
+var table status = table.new(position.top_right, 2, 7, border_width = 1)
+if barstate.islast and showStatus
+    string setupState = phase == 0 ? "Warten" : sdir == 1 ? "Long-Sweep aktiv" : "Short-Sweep aktiv"
+    color setupBg = phase == 0 ? cTblHead : sdir == 1 ? color.new(color.green, 40) : color.new(color.red, 40)
+    string stageTxt = phase == 0 ? "Warten auf Sweep" : phase == 1 ? "Sweep läuft (" + str.tostring(bar_index - swStartBar) + " Kerzen jenseits)" : not swReact ? swKind + " da → Reaktion abwarten" : swKind + " + Reaktion → erste FVG abwarten"
+    if phase != 0 and not swWithTrend
+        stageTxt := stageTxt + " (Gegen-Trend)"
+    string trendTxt = trendMode == "Aus" ? "aus" : trend == 1 ? "Aufwärts → Alarme nur Long" : trend == -1 ? "Abwärts → Alarme nur Short" : "neutral → nur markiert, keine Alarme"
+    if trendTooSmall
+        trendTxt := trendTxt + " ⚠ kleiner als Chart"
+    string arrows = "M5 " + f_arrow(trM5) + "  M15 " + f_arrow(trM15) + "  H1 " + f_arrow(trH1n) + "  H4 " + f_arrow(trH4n)
+    int openCnt = 0
+    int oi = 0
+    while oi < array.size(plans)
+        Plan po = array.get(plans, oi)
+        if po.state == 0
+            openCnt += 1
+        oi += 1
+    table.cell(status, 0, 0, "Ibo LTF Entry System 1.1", text_color = cTblText, bgcolor = cTblHead, text_size = tblSize)
+    table.cell(status, 1, 0, setupState, text_color = cTblText, bgcolor = setupBg, text_size = tblSize)
+    table.cell(status, 0, 1, "Ablauf", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 1, 1, stageTxt, text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 0, 2, "Trend (" + trendMode + ")", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 1, 2, trendTxt, text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 0, 3, "Struktur", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 1, 3, arrows, text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 0, 4, "Profil / Pläne", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    table.cell(status, 1, 4, prof + " · " + str.tostring(openCnt) + " offen", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    if showLot
+        string lotTxt = "–"
+        if array.size(plans) > 0
+            Plan lp = array.get(plans, array.size(plans) - 1)
+            float perLot = math.abs(lp.entry - lp.sl) * syminfo.pointvalue
+            if perLot > 0
+                lotTxt := str.tostring(account * riskPct / 100.0 / perLot, "#.##") + " Lot (letzter Plan)"
+        table.cell(status, 0, 5, "Lot (" + str.tostring(riskPct, "#.##") + "% Risiko)", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+        table.cell(status, 1, 5, lotTxt, text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+    if showStats
+        string gTxt = "Grab: " + str.tostring(array.get(st, 0)) + " Pläne · " + str.tostring(array.get(st, 1)) + " berührt · " + str.tostring(array.get(st, 2)) + " TP / " + str.tostring(array.get(st, 3)) + " SL"
+        string sTxt = "Sweep: " + str.tostring(array.get(st, 4)) + " Pläne · " + str.tostring(array.get(st, 5)) + " berührt · " + str.tostring(array.get(st, 6)) + " TP / " + str.tostring(array.get(st, 7)) + " SL"
+        table.cell(status, 0, 6, "Statistik", text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)
+        table.cell(status, 1, 6, gTxt + "\n" + sTxt, text_color = cTblText, bgcolor = cTblBg, text_size = tblSize)

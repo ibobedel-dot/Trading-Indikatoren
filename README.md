@@ -3,9 +3,9 @@
 Eigene TradingView-Indikatoren (Pine Script v6) für Pepperstone-Märkte:
 GER40, US500, NAS100, US30, XAUUSD, XAGUSD, SPOTCRUDE.
 
-## Ibo LTF Entry System 1.0
+## Ibo LTF Entry System 1.1
 
-Datei: `indikatoren/ibo-ltf-entry-system-1.0.pine` · Zeitrahmen: M1, M2, M5
+Datei: `indikatoren/ibo-ltf-entry-system-1.1.pine` (Version 1.0 liegt weiter daneben) · Zeitrahmen: M1, M2, M5
 
 **Ablauf**
 1. **Liquidität:** Signifikante Swing-Hochs (BSL) und Swing-Tiefs (SSL). Jedes Level wird nur einmal gesweept.
@@ -27,6 +27,7 @@ Alle Signale kommen nur auf Kerzenschluss. Die Zeiten gelten für Europe/Vienna.
 | Version | Änderung |
 |---|---|
 | 1.0 | Erste Version auf GitHub |
+| 1.1 | **Trend-Filter:** Gegen-Trend-Setups werden nur markiert (⚠ GEGEN-TREND, graues Label) statt gesperrt; Alarme nur für Mit-Trend-Setups; Trend-Pivot-Stärke 5, getrennt von den Setup-Swings. **Tabelle:** Standardgröße „small“, neue Einstellung „Tabellengröße“. **Sweep:** Close-Back innerhalb von 1–3 Kerzen (Grab), Tiefe 0,1–1 × ATR, Levels nach Stärke gewichtet (+1 Note bei starkem Level, optional nur starke Levels), Reaktion per Verdrängungskerze ≥ 0,7 × ATR, abgeholte Levels sind verbraucht. Alle Werte einstellbar. |
 
 ## In TradingView verwenden
 
