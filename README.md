@@ -28,6 +28,7 @@ Alle Signale kommen nur auf Kerzenschluss. Die Zeiten gelten für Europe/Vienna.
 |---|---|
 | 1.0 | Erste Version auf GitHub |
 | 1.1 | **Trend-Filter:** Gegen-Trend-Setups werden nur markiert (⚠ GEGEN-TREND, graues Label) statt gesperrt; Alarme nur für Mit-Trend-Setups; Trend-Pivot-Stärke 5, getrennt von den Setup-Swings. **Tabelle:** Standardgröße „small“, neue Einstellung „Tabellengröße“. **Sweep:** Close-Back innerhalb von 1–3 Kerzen (Grab), Tiefe 0,1–1 × ATR, Levels nach Stärke gewichtet (+1 Note bei starkem Level, optional nur starke Levels), Reaktion per Verdrängungskerze ≥ 0,7 × ATR, abgeholte Levels sind verbraucht. Alle Werte einstellbar. |
+| 1.2 | Kurze Labels (nur offene Pläne) und kurze Alarme für Watchlists, Plan ungültig bei Bruch der FVG, Schlüssel-Levels (Vortag, Vorwoche, Asia), Session-Filter für Alarme (London, NY AM, NY PM), Zähler inkl. Ergebnis in R, 26 Einstellungen, kein Spread, Standard: Trend H4 und FVG 0,3 × ATR (auf XAUUSD M5 optimiert). |
 
 ## In TradingView verwenden
 
